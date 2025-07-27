@@ -22,6 +22,12 @@ def draw(img, corners, imgpts):
 def get_and_process_img(fname, mtx, dist, newcameramtx):
     img = cv2.imread(fname)
     img = dnsz(img)    
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    h,s,v = cv2.split(cv2.cvtColor(img, cv2.COLOR_BGR2HSV))
+    v = clahe.apply(v)
+    hsv = cv2.merge([h,s,v])
+    #img[((v>170) & (s < 25)) | ((v<120) & (s < 45))] = 0    
+    img = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
     gray = img
     #gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5,5), 0)
@@ -63,7 +69,7 @@ def show_points3D_2(points1, points2, colors1=None, colors2=None):
     ax = fig.add_subplot(projection='3d')
     
     colors1 = (np.array(colors1)/255.0)[:,::-1] if colors1 is not None else 'blue'
-    colors2 = (np.array(colors2)/255.0)[:,::-1] if colors2 is not None else 'blue'
+    colors2 = (np.array(colors2)/255.0)[:,::-1] if colors2 is not None else 'red'
     
     ax.scatter(coords[0], coords[1], coords[2], c=colors1, marker='o', s=5)
     ax.scatter(coords2[0], coords2[1], coords2[2], c=colors2, marker='o', s=5)
@@ -510,7 +516,7 @@ def main3():
     show_points3D_2(np.float32(rec_origins), points3Dinit)    
 
 def get_good_features(img1, img2, newcameramtx):
-    detector = cv2.SIFT_create()
+    detector = cv2.SIFT_create(contrastThreshold=0.04)
     #detector = cv2.SIFT_create(contrastThreshold=0.04, edgeThreshold=10)
     #detector = cv2.SIFT_create(contrastThreshold=0.04*2, edgeThreshold=10*2)          # or ORB_create(), AKAZE_create(), etc.                   
     kpts1, desc1 = detector.detectAndCompute(img1, None)
@@ -519,7 +525,7 @@ def get_good_features(img1, img2, newcameramtx):
     raw_matches = matcher.knnMatch(desc1, desc2, k=2)            
     good = []
     for m,n in raw_matches:
-        if m.distance < 0.7 * n.distance:
+        if m.distance < 0.75 * n.distance:
             good.append(m)
             
     #matchesImg = cv2.drawMatches(img1, kpts1, img2, kpts2, good, None)
@@ -547,6 +553,46 @@ def get_good_features(img1, img2, newcameramtx):
     colors = [img2[int(p[1]), int(p[0])] for p in corners2]
     
     return corners1, corners2, used_kpts, used_descs, colors
+    
+def reprojection_error(points3D, points2D, R, t, newcameramtx):
+    rvec, _ = cv2.Rodrigues(R)    
+    #rvec = R   # projectPoints works both with 3x3 and 3x1 option
+    if points3D.shape[-1] == 3:
+        points3D = points3D.reshape(-1, 1, 3)
+    reproj_pts, jac = cv2.projectPoints(points3D, rvec, t, newcameramtx, None)
+    reproj_pts = reproj_pts.reshape(-1, 2)
+    points2D = points2D.reshape(-1, 2)    
+    err = (np.linalg.norm(points2D-reproj_pts, axis = 0))
+    rmse = np.sqrt(np.mean(err**2))
+    return rmse
+
+def do_pnp(pts3d_for_pnp, pts2d_for_pnp, K, iterations=500):    
+    num_pts = len(pts3d_for_pnp)
+    highest_inliers = 0
+    error = 1e9
+    R = np.zeros([3,1])
+    tvec = np.zeros([3,1])
+    for i in range(iterations):
+        pt_idxs = np.random.choice(num_pts, 6, replace=False)
+        pts3 = np.array([pts3d_for_pnp[pt_idxs[i]] for i in range(len(pt_idxs))])
+        pts2 = np.array([pts2d_for_pnp[pt_idxs[i]] for i in range(len(pt_idxs))])        
+        assert len(pts3.shape)==2 and len(pts2.shape)==3, "wrong input for solvePNP"
+        res, rvec, tvec = cv2.solvePnP(pts3, pts2, K, distCoeffs=np.array([]), flags=cv2.SOLVEPNP_ITERATIVE)
+        #res, rvec, tvec = cv2.solvePnP(pts3, pts2, K, distCoeffs=np.array([]), flags=cv2.SOLVEPNP_EPNP)
+        if not res:
+            continue
+        R, _ = cv2.Rodrigues(rvec)        
+        rmse = reprojection_error(pts3, pts2, R, tvec, K)
+        if rmse < error:
+            error = rmse            
+            best_R = rvec
+            best_tvec = tvec
+             
+    R = best_R
+    tvec = best_tvec
+    #print('rvec:', rvec,'\n\ntvec:', tvec)
+
+    return R, tvec
 
 def main4():        
     images_path = "./data/truck2"
@@ -574,25 +620,27 @@ def main4():
     PC, CLR, KP, DSC = 0, 1, 2, 3
     point_clouds = []   # list of (points3D, keypoints, descriptors)
 
-    for i in range(1, len(images)-1):
+    for i in range(0, len(images)-1):
     #for i in range(3):
         origins = []
-        print(images[i], images[i+1])
+        print(i, images[i], images[i+1])
         img1 = get_and_process_img(images[i], mtx, dist, newcameramtx)
         img2 = get_and_process_img(images[i+1], mtx, dist, newcameramtx)
         
         # find feature points...
-        
+        detector = cv2.SIFT_create(contrastThreshold=0.04)
         #if points3D is None:
         if len(point_clouds) == 0:
-            detector = cv2.SIFT_create()
+            
             kpts1, desc1 = detector.detectAndCompute(img1, None)
-            kpts2, desc2 = detector.detectAndCompute(img2, None)            
+            kpts2, desc2 = detector.detectAndCompute(img2, None)          
+            
             matcher = cv2.FlannBasedMatcher()
+            #matcher = cv2.BFMatcher()
             raw_matches = matcher.knnMatch(desc1, desc2, k=2)            
             good = []
             for m,n in raw_matches:
-                if m.distance < 0.7 * n.distance:
+                if m.distance < 0.75 * n.distance:
                     good.append(m)
                     
             #matchesImg = cv2.drawMatches(img1, kpts1, img2, kpts2, good, None)
@@ -625,6 +673,11 @@ def main4():
             
             homog_pts4d = cv2.triangulatePoints(P1, P2, pts1_in, pts2_in)        
             points3D = cv2.convertPointsFromHomogeneous(homog_pts4d.T)
+                        
+            rmse2 = reprojection_error(points3D, corners2[inliers], R, t, newcameramtx)
+            rmse1 = reprojection_error(points3D, corners1[inliers], R0, t0, newcameramtx)            
+            print('reproj err', rmse2, rmse1)
+            #continue
             
             used_kpts = used_kpts[inliers]
             used_descs = used_descs[inliers]
@@ -645,21 +698,23 @@ def main4():
         else:
             kpts2, desc2 = detector.detectAndCompute(img2, None)    # second keypoints for first img from pair
             matcher = cv2.FlannBasedMatcher()
+            #matcher = cv2.BFMatcher()
             raw_matches = matcher.knnMatch(point_clouds[-1][DSC], desc2, k=2)            
             good = []
             for m,n in raw_matches:
-                if m.distance < 0.6 * n.distance:
+                if m.distance < 0.75 * n.distance:
                     good.append(m)                    
             
             matchesImg = cv2.drawMatches(img1, point_clouds[-1][KP], img2, kpts2, good, None)
             cv2.imshow('kp', dnsz(matchesImg))    
-            cv2.waitKey(100)
+            cv2.waitKey(50)
                     
             corners1 = np.float32([point_clouds[-1][KP][m.queryIdx].pt for m in good])
             corners2 = np.float32([kpts2[m.trainIdx].pt for m in good])
             used_kpts = np.array([kpts2[m.trainIdx] for m in good])
             used_descs = np.array([desc2[m.trainIdx] for m in good])
             points3D = np.array([point_clouds[-1][PC][m.queryIdx] for m in good])
+            
         
         if len(corners1.shape) == 2:
             print('!!!???!!!??')
@@ -678,15 +733,34 @@ def main4():
             print('not enough features to recover pose')
             continue
         
-        ret, rvec1, tvec1, inl1 = cv2.solvePnPRansac(pts3Dsqz, corners1, newcameramtx, None)
-        ret, rvec2, tvec2, inl2 = cv2.solvePnPRansac(pts3Dsqz, corners2, newcameramtx, None)
+        '''F, mask = cv2.findFundamentalMat(corners1, corners2, cv2.FM_RANSAC, 1.0, 0.999) # need to correctly sort pairs of points ??
+        corners1 = corners1[mask.ravel() == 1]
+        corners2 = corners2[mask.ravel() == 1]        
+        pts3Dsqz = pts3Dsqz[mask.ravel() == 1]
+        '''
+        ret, rvec1, tvec1, inl1 = cv2.solvePnPRansac(pts3Dsqz, corners1, newcameramtx, None, flags=cv2.SOLVEPNP_ITERATIVE, reprojectionError=2.0, iterationsCount=1000)
+        ret, rvec2, tvec2, inl2 = cv2.solvePnPRansac(pts3Dsqz, corners2, newcameramtx, None, flags=cv2.SOLVEPNP_ITERATIVE, reprojectionError=2.0, iterationsCount=1000)
+        
         print('num inliers', len(inl1) if inl1 is not None else 0, len(inl2) if inl2 is not None else 0)
         if inl1 is None or inl2 is None or max(len(inl1), len(inl2)) < 20:
             print('too little inliers')
             continue
             
-        rvec1, tvec1 = cv2.solvePnPRefineLM(pts3Dsqz, corners1, newcameramtx, None, rvec1, tvec1)
-        rvec2, tvec2 = cv2.solvePnPRefineLM(pts3Dsqz, corners2, newcameramtx, None, rvec2, tvec2)
+        rmse1 = reprojection_error(pts3Dsqz, corners1, rvec1, tvec1, newcameramtx)
+        rmse2 = reprojection_error(pts3Dsqz, corners2, rvec2, tvec2, newcameramtx)                    
+        print('approx reg reproj err', rmse1, rmse2)
+        
+        corn_inl1 = corners1[inl1].squeeze(axis=1)
+        corn_inl2 = corners2[inl2].squeeze(axis=1)
+        pts3D_inl1 = pts3Dsqz[inl1].squeeze(axis=1)
+        pts3D_inl2 = pts3Dsqz[inl2].squeeze(axis=1)
+            
+        rvec1, tvec1 = cv2.solvePnPRefineLM(pts3D_inl1, corn_inl1, newcameramtx, None, rvec1, tvec1, criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER, 1000, 1e-6))
+        rvec2, tvec2 = cv2.solvePnPRefineLM(pts3D_inl2, corn_inl2, newcameramtx, None, rvec2, tvec2, criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER, 1000, 1e-6))
+        #ret, rvec2, tvec2 = cv2.solvePnP(pts3D_inl2, corn_inl2, newcameramtx, None)
+        #rvec2, tvec2 = do_pnp(pts3D_inl2, corn_inl2, newcameramtx)
+        #rvec1, tvec1 = do_pnp(pts3Dsqz, corners1, newcameramtx)
+        #rvec2, tvec2 = do_pnp(pts3Dsqz, corners2, newcameramtx)
         
         R1, _ = cv2.Rodrigues(rvec1)
         R2, _ = cv2.Rodrigues(rvec2)
@@ -699,20 +773,30 @@ def main4():
         rec_origins.append(orig2)
         rec_origins.append(orig2 + fwd2*0.2)
         
-        P1 = np.hstack((R1.T, np.array([orig1]).T))   # .T ???
-        P2 = np.hstack((R2.T, np.array([orig2]).T))
+        #P1 = np.hstack((R1.T, np.array([orig1]).T))   # .T ???
+        #P2 = np.hstack((R2.T, np.array([orig2]).T))
+        P1 = np.hstack((R1, tvec1))   # .T ???
+        P2 = np.hstack((R2, tvec2))
+        
 
         P1 = newcameramtx @ P1
         P2 = newcameramtx @ P2
         
         pts1, pts2, used_kpts, used_descs, colors = get_good_features(img1, img2, newcameramtx)
 
-        homog_pts4d = cv2.triangulatePoints(P1, P2, pts2.T, pts1.T)     # TODO: fix pts indexation
+        homog_pts4d = cv2.triangulatePoints(P1, P2, pts1.T, pts2.T)     
         newpoints3D = cv2.convertPointsFromHomogeneous(homog_pts4d.T)
+        
+        rmse1 = reprojection_error(newpoints3D, pts1, R1, tvec1, newcameramtx)
+        rmse2 = reprojection_error(newpoints3D, pts2, R2, tvec2, newcameramtx)                    
+        print('big reg reproj err', rmse1, rmse2)
         
         #show_points3D_2(np.float32(rec_origins), newpoints3D)    
         
         point_clouds.append((newpoints3D, colors, used_kpts, used_descs))
+        
+        #if len(point_clouds) >= 2:
+        #    show_points3D_2(point_clouds[-1][PC], point_clouds[-2][PC])
         
     #show_points3D_2(np.float32(rec_origins), points3Dinit)    
     merged_pcloud = point_clouds[0][PC]
